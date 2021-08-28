@@ -1,0 +1,17 @@
+[package]
+name = "ffmpeg-frame-encoder"
+version = "0.1.0"
+authors = ["Viv Lim <git@vvn.space>", "lifning <lifning+git@pm.me>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num_enum = "^0.4"
+ffmpeg-next = "4.3.8"
+structopt = "^0.3"
+mammut = "0.13.0"
+toml = "0.5.8"
+crossbeam-channel = "0.5.1"
+
+[dev-dependencies]
