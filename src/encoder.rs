@@ -232,6 +232,7 @@ impl CollectedAVFfmpegEncoder {
                         // Both graphs are out of data, and both encoders are at the end of the file.
                         if let Some(ffmpeg_context) = &mut self.ffmpeg_context {
                             ffmpeg_context.octx.get_mut().write_trailer().unwrap();
+                            println!("wrote trailer");
                         }
                         break; // Exit the loop
                     },
@@ -239,12 +240,14 @@ impl CollectedAVFfmpegEncoder {
                         // Both graphs are out of data, but encoders aren't done yet.
                         // Send one EOF to each encoder.
                         if !eof_was_sent_to_encoders {
+                            let mut succeeded = true;
                             if let Some(FfmpegContext{ video: Some(video_context), .. }) = &mut self.ffmpeg_context {
                                 match video_context.encoder.send_eof() {
                                     Err(ffmpeg::Error::Other { errno: 11 /* temporarily unavailable */}) => {
                                         println!("eof for video failed (temporarily unavailable)");
+                                        succeeded = false;
                                     },
-                                    Ok(_) => (),
+                                    Ok(_) => { succeeded = succeeded && true; }
                                     Err(e) => {
                                         panic!("error when sending video eof: {}", e);
                                     }
@@ -254,14 +257,17 @@ impl CollectedAVFfmpegEncoder {
                                 match audio_context.encoder.send_eof() {
                                     Err(ffmpeg::Error::Other { errno: 11 /* temporarily unavailable */}) => {
                                         println!("eof for audio failed (temporarily unavailable)");
+                                        succeeded = false;
                                     },
-                                    Ok(_) => (),
+                                    Ok(_) => { succeeded = succeeded && true; }
                                     Err(e) => {
                                         panic!("error when sending audio eof: {}", e);
                                     }
                                 }
                             }
-                            eof_was_sent_to_encoders = true;
+                            if succeeded {
+                                eof_was_sent_to_encoders = true;
+                            }
                         }
                     },
                     _ => () // Any other combination doesn't matter
@@ -317,7 +323,6 @@ impl CollectedAVFfmpegEncoder {
             (Some(ffmpeg_context), FrameData::End) => {
                 // stop processing frames
                 self.is_ending = true;
-
             }, 
 
             _ => {
