@@ -1,10 +1,10 @@
 extern crate ffmpeg_next as ffmpeg;
 use std::{borrow::BorrowMut, cell::RefCell, convert::TryInto, path::{self, Path, PathBuf}, thread::{self, JoinHandle, Thread}, time::Duration};
 
-use crossbeam_channel::{Receiver};
+use crossbeam_channel::{Receiver, Sender};
 use ffmpeg::{ChannelLayout, Rational, filter, format::Pixel, frame, util::format, Rescale};
 
-use crate::{filters::{make_audio_filter, make_video_filter}, sink::{AudioPlane, Frame, FrameData, RetroAVCollector, VideoPlane}};
+use crate::{filters::{make_audio_filter, make_video_filter}, logger::{self, log_thread::{Event, HtmlTableLogger, LogMessage, LogSources, ThreadedLogger}}, sink::{AudioPlane, Frame, FrameData, RetroAVCollector, VideoPlane}};
 
 #[derive(Debug, Clone)]
 pub enum OutputArgs {
@@ -13,15 +13,38 @@ pub enum OutputArgs {
     Audio(AudioArgs),
 }
 
-pub fn start_thread(receiver: Receiver<Frame<FrameData>>, path: PathBuf) -> JoinHandle<Result<(), ()>> {
+pub fn start_thread(receiver: Receiver<Frame<FrameData>>, path: PathBuf, log_path: Option<PathBuf>) -> JoinHandle<Result<(), ()>> {
+    let logger = match log_path {
+        Some(path) => Some(HtmlTableLogger::<LogSources>::new(path)),
+        None => None,
+    };
+
     let mut encoder = CollectedAVFfmpegEncoder {
         receiver,
         video_path: path.into_boxed_path(),
         ffmpeg_context: None,
-        is_ending: false
+        is_ending: false,
+        logger: match &logger {
+            Some(logger) => Some(logger.get_sender()),
+            None => None,
+        }
     };
 
-    thread::spawn(move || encoder.read_collector_to_end())
+    thread::spawn(move || {
+        let logger_handle = match logger {
+            Some(mut logger) => Some((logger.begin(), logger.get_sender())),
+            None => None,
+        };
+        encoder.read_collector_to_end().unwrap();
+        match logger_handle {
+            Some((joinhandle, channel)) => {
+                channel.send(LogMessage::Eof).unwrap();
+                joinhandle.join().unwrap()
+            },
+            None => Ok(()),
+        }.unwrap();
+        return Ok(());
+    })
 }
 
 
@@ -33,6 +56,7 @@ pub struct CollectedAVFfmpegEncoder {
     ffmpeg_context: Option<FfmpegContext>,
 
     is_ending: bool,
+    logger: Option<Sender<LogMessage<LogSources>>>
 }
 
 #[derive(Debug, Clone)]
@@ -281,16 +305,17 @@ impl CollectedAVFfmpegEncoder {
     pub fn handle_frame(&mut self, frame: Frame<FrameData>) {
         //println!("Handling frame kind {:?}", frame.data);
         let frame_number = frame.frame_number;
-        match (&mut self.ffmpeg_context, frame.data) {
-            (Some(FfmpegContext { video: Some(video_context), .. }), FrameData::Video(vplane)) => {
+        match (&mut self.ffmpeg_context, frame.data, &self.logger) {
+            (Some(FfmpegContext { video: Some(video_context), .. }), FrameData::Video(vplane), logger) => {
                 let mut frame = frame_from_video_plane(&vplane, video_context);
                 frame.set_pts(Some(frame_number as i64));
                 // push frame to filter
                 println!("frame pushed to filter");
+                write_log(logger, LogSources::Sink, format!("Video frame {}, pts {}", frame_number, frame_number));
                 video_context.filter.get("in").unwrap().source().add(&frame).unwrap();
             },
 
-            (Some(FfmpegContext { audio: Some(audio_context), .. }), FrameData::Audio(aplane)) => {
+            (Some(FfmpegContext { audio: Some(audio_context), .. }), FrameData::Audio(aplane), logger) => {
                 let mut frame = frame_from_audio_plane(&aplane, audio_context);
 
                 let new_pts = unsafe {
@@ -302,10 +327,12 @@ impl CollectedAVFfmpegEncoder {
                 };
                 frame.set_pts(Some(new_pts));
                 // push frame to filter
+                write_log(logger, LogSources::Sink, format!("Audio frame {}, pts {}", frame_number, new_pts));
                 audio_context.filter.get("in").unwrap().source().add(&frame).unwrap();
             },
-            (None, FrameData::Configure(output_args)) => {
+            (None, FrameData::Configure(output_args), logger) => {
                 // Create a new ffmpeg context using the provided config.
+                write_log(logger, LogSources::Sink, format!("Configure frame {}, {:?}", frame_number, output_args));
                 match FfmpegContext::new(output_args, self.video_path.clone()) {
                     Ok(context) => {
                         self.ffmpeg_context = Some(context);
@@ -316,12 +343,14 @@ impl CollectedAVFfmpegEncoder {
                 }
             },
 
-            (Some(ffmpeg_context), FrameData::Configure(output_args)) => {
+            (Some(ffmpeg_context), FrameData::Configure(output_args), logger) => {
                 println!("Reconfiguring after a ffmpeg context already exists is not implemented.");
+                write_log(logger, LogSources::Sink, format!("Rejected configure frame {}, {:?}", frame_number, output_args));
             }
 
-            (Some(ffmpeg_context), FrameData::End) => {
+            (Some(ffmpeg_context), FrameData::End, logger) => {
                 // stop processing frames
+                write_log(logger, LogSources::Sink, format!("Stop processing frames @ {}", frame_number));
                 self.is_ending = true;
             }, 
 
@@ -332,11 +361,12 @@ impl CollectedAVFfmpegEncoder {
     }
 
     fn get_filtered_video_frame_and_start_encode(&mut self) -> Result<(), ffmpeg::Error> {
-        match &mut self.ffmpeg_context {
-            Some(FfmpegContext { video: Some(video_context), .. }) => {
+        match (&mut self.ffmpeg_context, &self.logger) {
+            (Some(FfmpegContext { video: Some(video_context), .. }), logger) => {
                 let mut filtered_vframe = frame::Video::empty();
                 match video_context.filter.get("out").unwrap().sink().frame(&mut filtered_vframe) {
                     Ok(..) => {
+                        write_log(logger, LogSources::Filter, format!("Video frame pts {:?}", filtered_vframe.pts()));
                         eprintln!("🎥 Got filtered video frame {}x{} pts {:?}", filtered_vframe.width(), filtered_vframe.height(), filtered_vframe.pts());
                         if video_context.filter.get("in").unwrap().source().failed_requests() > 0 {
                             println!("🎥 failed to put filter input frame");
@@ -347,18 +377,19 @@ impl CollectedAVFfmpegEncoder {
                     Err(e) => Err(e)
                 }
             },
-            Some(FfmpegContext { video: None, .. }) => Ok(()), // No-op when we aren't doing video
-            None => { panic!("Shouldn't try to encode when there is no ffmpeg context"); }
+            (Some(FfmpegContext { video: None, .. }), _) => Ok(()), // No-op when we aren't doing video
+            (None, _) => { panic!("Shouldn't try to encode when there is no ffmpeg context"); }
         }
     }
 
 
     fn get_filtered_audio_frame_and_start_encode(&mut self) -> Result<(), ffmpeg::Error> {
-        match &mut self.ffmpeg_context {
-            Some(FfmpegContext { audio: Some(audio_context), .. }) => {
+        match (&mut self.ffmpeg_context, &self.logger) {
+            (Some(FfmpegContext { audio: Some(audio_context), .. }), logger) => {
                 let mut filtered_aframe = frame::Audio::empty();
                 match audio_context.filter.get("out").unwrap().sink().frame(&mut filtered_aframe) {
                     Ok(..) => {
+                        write_log(logger, LogSources::Filter, format!("Audio frame pts {:?}", filtered_aframe.pts()));
                         eprintln!("🔊 Got filtered audio frame {:?} pts {:?}", filtered_aframe, filtered_aframe.pts());
                         if audio_context.filter.get("in").unwrap().source().failed_requests() > 0 {
                             println!("🎥 failed to put filter input frame");
@@ -370,18 +401,19 @@ impl CollectedAVFfmpegEncoder {
                     Err(e) => Err(e)
                 }
             },
-            Some(FfmpegContext { audio: None, .. }) => Ok(()), // No-op when we aren't doing audio
-            None => { panic!("Shouldn't try to encode when there is no ffmpeg context"); }
+            (Some(FfmpegContext { audio: None, .. }), _) => Ok(()), // No-op when we aren't doing audio
+            (None, _) => { panic!("Shouldn't try to encode when there is no ffmpeg context"); }
         }
     }
 
     fn write_encoded_video_packet(&mut self) -> Result<(), ffmpeg::Error>{
-        match &mut self.ffmpeg_context {
-            Some(FfmpegContext { video: Some(video_context), octx, .. }) => {
+        match (&mut self.ffmpeg_context, &self.logger) {
+            (Some(FfmpegContext { video: Some(video_context), octx, .. }), logger) => {
                 let mut encoded_packet = ffmpeg::Packet::empty();
                 match video_context.encoder.receive_packet(&mut encoded_packet) {
                     Ok(..) => {
                         encoded_packet.set_stream(0);
+                        write_log(logger, LogSources::Encoder, format!("Video packet pts {:?} dts {:?}", encoded_packet.pts(), encoded_packet.dts()));
                         eprintln!("📦 Writing packet, pts {:?} dts {:?} size {}", encoded_packet.pts(), encoded_packet.dts(), encoded_packet.size());
                         let octx = octx.get_mut();
                         encoded_packet.rescale_ts(Rational(1, video_context.args.fps as i32), octx.stream(0).unwrap().time_base());
@@ -397,17 +429,18 @@ impl CollectedAVFfmpegEncoder {
                     Err(e) => Err(e)
                 }
             },
-            Some(FfmpegContext { video: None, .. }) => Ok(()), // No-op when we aren't doing video
-            None => { panic!("Shouldn't try to write encoded packets when there is no ffmpeg context"); }
+            (Some(FfmpegContext { video: None, .. }), _) => Ok(()), // No-op when we aren't doing video
+            (None, _) => { panic!("Shouldn't try to write encoded packets when there is no ffmpeg context"); }
         }
     }
     fn write_encoded_audio_packet(&mut self) -> Result<(), ffmpeg::Error>{
-        match &mut self.ffmpeg_context {
-            Some(FfmpegContext { audio: Some(audio_context), octx, .. }) => {
+        match (&mut self.ffmpeg_context, &self.logger) {
+            (Some(FfmpegContext { audio: Some(audio_context), octx, .. }), logger) => {
                 let mut encoded_packet = ffmpeg::Packet::empty();
                 match audio_context.encoder.receive_packet(&mut encoded_packet) {
                     Ok(..) => {
                         encoded_packet.set_stream(1);
+                        write_log(logger, LogSources::Encoder, format!("Audio packet pts {:?} dts {:?}", encoded_packet.pts(), encoded_packet.dts()));
                         eprintln!("📦 Writing audio packet, pts {:?} dts {:?} size {}", encoded_packet.pts(), encoded_packet.dts(), encoded_packet.size());
                         match encoded_packet.write_interleaved(octx.get_mut()) {
                             Ok(..) => Ok(()),
@@ -420,10 +453,11 @@ impl CollectedAVFfmpegEncoder {
                     Err(e) => Err(e)
                 }
             },
-            Some(FfmpegContext { audio: None, .. }) => Ok(()), // No-op when we aren't doing audio
-            None => { panic!("Shouldn't try to write encoded packets when there is no ffmpeg context"); }
+            (Some(FfmpegContext { audio: None, .. }), _) => Ok(()), // No-op when we aren't doing audio
+            (None, _) => { panic!("Shouldn't try to write encoded packets when there is no ffmpeg context"); }
         }
     }
+
 }
 
 
@@ -462,3 +496,12 @@ fn frame_from_audio_plane(aplane: &AudioPlane, audio_context: &mut FfmpegAudioCo
     aframe
 }
 
+
+fn write_log(logger: &Option<Sender<LogMessage<LogSources>>>, source: LogSources, message: String) {
+    if let Some(logger) = logger {
+        logger.send(LogMessage::Event(Event::<LogSources> {
+            source,
+            description: message,
+        })).unwrap();
+    }
+}
