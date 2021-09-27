@@ -57,12 +57,18 @@ pub fn make_audio_filter(
     audio_args: &AudioArgs
 ) -> Result<filter::Graph, ffmpeg::Error> {
     let mut afilter = filter::Graph::new();
-    let args = format!("time_base=1/44100:sample_rate={}:sample_fmt=s16:channel_layout=stereo", audio_args.sample_rate);
+    let args = format!("time_base=1/{}:sample_rate={}:sample_fmt=s16:channel_layout=stereo", audio_args.sample_rate, audio_args.sample_rate);
     eprintln!("🔊 filter args: {}", args);
     afilter.add(&filter::find("abuffer").unwrap(), "in", &args)?;
     //aresample?
     afilter.add(&filter::find("abuffersink").unwrap(), "out", "")?;
 
+    {
+        let mut in_f = afilter.get("in").unwrap();
+        //in_f.set_sample_format(audio_args.format());
+        //in_f.set_channel_layout(audio_encoder.channel_layout());
+        in_f.set_sample_rate(audio_args.sample_rate);
+    }
     {
         let mut out = afilter.get("out").unwrap();
         out.set_sample_format(audio_encoder.format());
