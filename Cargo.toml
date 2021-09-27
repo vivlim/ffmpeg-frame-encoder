@@ -1,5 +1,5 @@
 [package]
-name = "ffmpeg-frame-encoder"
+name = "libav-frame-encoder"
 version = "0.1.0"
 authors = ["Viv Lim <git@vvn.space>", "lifning <lifning+git@pm.me>"]
 edition = "2018"

@@ -11,6 +11,9 @@ pub fn make_video_filter(
 
     let pixel_format_string = match video_args.pixel_format {
         ffmpeg::format::Pixel::BGRA => "bgra",
+        ffmpeg::format::Pixel::RGB555 => if cfg!(target_endian = "big") { "rgb555be" } else { "rgb555le" },
+        ffmpeg::format::Pixel::RGB32 => "argb",
+        ffmpeg::format::Pixel::RGB565 => if cfg!(target_endian = "big") { "rgb565be" } else { "rgb565le" },
         _ => {panic!("need to build pixel format strings in a more general way.");}
     };
 
