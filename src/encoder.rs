@@ -368,7 +368,7 @@ impl CollectedAVFfmpegEncoder {
                 frame.set_pts(Some(new_pts));*/
                 frame.set_pts(Some(frame_number as i64));
                 // push frame to filter
-                write_log(logger, LogSources::Sink, format!("Audio frame {}", frame_number))?;
+                write_log(logger, LogSources::Sink, format!("Audio frame {} with {} bytes: {:?}", frame_number, aplane.data.len(), aplane))?;
                 audio_context.filter.get("in").unwrap().source().add(&frame)?;
             },
             (None, FrameData::Configure(output_args), logger) => {
