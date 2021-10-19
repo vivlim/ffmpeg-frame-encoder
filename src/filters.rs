@@ -1,6 +1,6 @@
 extern crate ffmpeg_next as ffmpeg;
 
-use ffmpeg::filter;
+use ffmpeg::{codec::audio, filter};
 
 use crate::encoder::{AudioArgs, VideoArgs};
 
@@ -78,7 +78,7 @@ pub fn make_audio_filter(
 
     afilter.output("in", 0)?
         .input("out", 0)?
-        .parse("anull")?;
+        .parse(&format!("volume={}", audio_args.volume))?;
     afilter.validate()?;
     // human-readable filter graph
     eprintln!("{}", afilter.dump());

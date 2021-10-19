@@ -93,6 +93,7 @@ pub struct VideoArgs {
 #[derive(Debug, Clone)]
 pub struct AudioArgs {
     pub sample_rate: u32,
+    pub volume: f32
 }
 
 struct FfmpegContext {
